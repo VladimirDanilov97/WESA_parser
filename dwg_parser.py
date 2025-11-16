@@ -4,57 +4,39 @@ import time
 import win32com.client
 import pythoncom
 import psutil  # Для завершения процессов
+import json
 
 
 class AutoCADProcessor:
-    def __init__(self, replacement_digit, log_callback=None, debug=False):
-        pythoncom.CoInitialize()  # Инициализация COM
-        self.debug = debug  # Флаг отладки
-        if not re.match(r'^\d$', str(replacement_digit)):
-            raise ValueError("Replacement digit must be 0-9")
-
+    def __init__(self, replacement_digit, project, rules, log_callback=None, debug=False):
+        pythoncom.CoInitialize()
         self.replacement_digit = str(replacement_digit)
+        self.debug = debug
         self.log = log_callback or (lambda msg: print(msg))
+        self._log(f"Инициализация AutoCADProcessor с цифрой: {self.replacement_digit} и проектом: {project}")
+        self.patterns = self._load_patterns(rules)
         self.com_app = None
         self.com_doc = None
         self._initialize_autocad()
 
-        self.patterns = [
-            (re.compile(r'\b(ED\.D\.[A-Z]\d{3}\.)\d\b'),
-             lambda m: f"{m.group(1)}{self.replacement_digit}"),
-            (re.compile(r'\b\d\d[A-Z]{3}\d\d[A-Z]{1,2}\d{3,4}\b'),
-             lambda m: self.replacement_digit + m.group(0)[1:]),
-            (re.compile(r'\((\d{2}[A-Z]{3,})\)'),
-             lambda m: f"({self.replacement_digit}{m.group(1)[1:]})"),
-            (re.compile(r'\b\d\d[A-Z]{3}\d\d\b'),
-             lambda m: self.replacement_digit + m.group(0)[1:]),
-            (re.compile(r'\b([0-9])0([A-Z]{3})\b', flags=re.IGNORECASE),
-             lambda m: f"{self.replacement_digit}0{m.group(2)}"),
-            (re.compile(r'C0[2-9]\b'),
-             'C01'),
-            (re.compile(r'(Unit )\d\b', flags=re.IGNORECASE),
-             lambda m: f"{m.group(1)}{self.replacement_digit}"),
-            (re.compile(r'(Блок )\d\b', flags=re.IGNORECASE),
-             lambda m: f"{m.group(1)}{self.replacement_digit}"),
-        ]
-
-        self.delete_text_patterns = [
-            re.compile(r'^C0[0-9]$'),
-            re.compile(r'^-+$'),
-            re.compile(r'^Repl\.$'),
-            re.compile(r'^Зам\.$'),
-            re.compile(r'^\d{4,5}-\d{2}$'),
-            re.compile(r'^\d{2}\.\d{2,4}$'),
-        ]
-
-        # Новый параметр: толерантность для группировки по Y (учитываем float-погрешности)
-        self.y_tolerance = 0.1  # Можно настроить под ваши чертежи
-
-        # Словарь для кандидатов на удаление: {approx_y: [(entity, text, exact_y, x)]}
-        self.delete_candidates = {}
+    def _load_patterns(self, rules):
+        patterns = []
+        try:
+            for rule_name, rule in rules.items():
+                try:
+                    pattern = eval(rule["pattern"], {"re": re})
+                    replacement = eval(rule["replacement"], {"self": self})
+                    patterns.append((pattern, replacement))
+                    self._log(f"Загружено правило '{rule_name}'")
+                except Exception as e:
+                    self._log(f"Ошибка загрузки правила '{rule_name}': {e}")
+        except Exception as e:
+            self._log(f"Ошибка обработки rules: {e}")
+        if not patterns:
+            self._log("Предупреждение: Нет patterns для этого парсера")
+        return patterns
 
     def _initialize_autocad(self):
-        """Инициализация или переинициализация COM-интерфейса AutoCAD с повторами."""
         retries = 3
         for attempt in range(retries):
             try:
@@ -76,16 +58,15 @@ class AutoCADProcessor:
                 pythoncom.CoInitialize()
 
     def wait_for_object_ready(self, obj, timeout=20.0, check_type="app"):
-        """Ожидание готовности COM-объекта с улучшенной проверкой."""
         start_time = time.time()
         while time.time() - start_time < timeout:
             try:
                 pythoncom.PumpWaitingMessages()
                 if obj is not None:
                     if check_type == "app":
-                        _ = obj.Version  # Проверка свойства Version для приложения
+                        _ = obj.Version
                     else:
-                        _ = obj.Name  # Проверка свойства Name для документа
+                        _ = obj.Name
                     return True
             except Exception as e:
                 self._log(f"Ошибка проверки готовности объекта ({check_type}): {e}")
@@ -94,13 +75,12 @@ class AutoCADProcessor:
         return False
 
     def _terminate_autocad(self):
-        """Принудительное завершение процессов AutoCAD при их зависании."""
         try:
             for proc in psutil.process_iter(['name']):
                 if proc.info['name'].lower().startswith('acad'):
                     proc.kill()
                     self._log("Процесс AutoCAD завершен")
-            time.sleep(1)  # Даем время на завершение процесса
+            time.sleep(1)
         except Exception as e:
             self._log(f"Ошибка при завершении процесса AutoCAD: {e}")
         self.com_app = None
@@ -117,9 +97,6 @@ class AutoCADProcessor:
         )
         if self.debug or always_log:
             self.log(message)
-
-    def _is_text_to_delete(self, text):
-        return any(pattern.match(text) for pattern in self.delete_text_patterns)
 
     def _apply_replacements(self, text):
         if not text:
@@ -144,31 +121,13 @@ class AutoCADProcessor:
                 self._log(f"Обработка объекта {etype} в {location}")
                 if etype in ("AcDbText", "AcDbMText"):
                     try:
-                        insertion_point = entity.InsertionPoint
-                        x, y = insertion_point[0], insertion_point[1]
                         txt = entity.TextString
-                    except Exception as e:
-                        self._log(f"Ошибка доступа к свойствам текста в {location}: {e}")
-                        return
-
-                    # Вместо проверки области и немедленного удаления:
-                    if self._is_text_to_delete(txt):
-                        # Приближённый Y для группировки (округляем до толерантности)
-                        approx_y = round(y / self.y_tolerance) * self.y_tolerance
-                        if approx_y not in self.delete_candidates:
-                            self.delete_candidates[approx_y] = []
-                        self.delete_candidates[approx_y].append((entity, txt, y, x))
-                        self._log(f"Кандидат на удаление: {txt} в ({x}, {y}) {location}")
-                        # Не удаляем сразу — это сделаем позже
-
-                    # Продолжаем с заменами (если нужно, но замена и удаление — отдельно)
-                    new_txt = self._apply_replacements(txt)
-                    if new_txt != txt:
-                        try:
+                        new_txt = self._apply_replacements(txt)
+                        if new_txt != txt:
                             entity.TextString = new_txt
                             self._log(f"Замена в {location}: {txt} → {new_txt}")
-                        except Exception as e:
-                            self._log(f"Ошибка установки TextString в {location}: {e}")
+                    except Exception as e:
+                        self._log(f"Ошибка обработки текста в {location}: {e}")
                 elif etype == "AcDbMLeader":
                     try:
                         txt = entity.TextString
@@ -190,7 +149,7 @@ class AutoCADProcessor:
                                     self._log(f"Замена в атрибуте блока {location}: {txt} → {new_txt}")
                             except Exception as e:
                                 self._log(f"Ошибка обработки атрибута в {location}: {e}")
-                                continue  # Пропускаем проблемный атрибут
+                                continue
                     except Exception as e:
                         self._log(f"Ошибка доступа к атрибутам блока в {location}: {e}")
                 return
@@ -263,11 +222,7 @@ class AutoCADProcessor:
                     except Exception as e:
                         self._log(f"Пропуск листа {layout.Name} из-за ошибки: {e}")
                         continue
-
-                # После обработки всех entities: анализируем и удаляем кандидаты
-                self._delete_grouped_candidates()
-
-                return True  # Успешная обработка
+                return True
             except Exception as e:
                 self._log(f"Ошибка обработки объектов на попытке {attempt + 1}: {e}")
                 if attempt < retries - 1:
@@ -288,33 +243,11 @@ class AutoCADProcessor:
                     self._initialize_autocad()
                     return False
 
-    def _delete_grouped_candidates(self):
-        """Удаление групп кандидатов на одной Y."""
-        for approx_y, group in self.delete_candidates.items():
-            if len(group) >= 2:  # Удаляем, если в группе >=2 (настройте по вкусу)
-                # Опционально: сортируем по X для лога
-                group.sort(key=lambda item: item[3])  # По X
-                texts = [item[1] for item in group]
-                self._log(f"Группа на Y≈{approx_y}: {texts} — удаление")
-                for entity, txt, y, x in group:
-                    try:
-                        entity.Delete()
-                        self._log(f"Удален: {txt} в ({x}, {y})")
-                    except Exception as e:
-                        self._log(f"Ошибка удаления: {txt} — {e}")
-            else:
-                self._log(f"Одиночный на Y≈{approx_y}: не удаляем")
-
-        # Очищаем candidates после обработки
-        self.delete_candidates = {}
-
     def process_file(self, input_path, output_path):
-        self.delete_candidates = {}  # Сброс перед каждым файлом
         retries = 3
         success = False
         for attempt in range(retries):
             try:
-                # Проверяем, что AutoCAD готов перед открытием файла
                 if not self.wait_for_object_ready(self.com_app, timeout=20.0, check_type="app"):
                     self._log(f"AutoCAD не готов для открытия {input_path} на попытке {attempt + 1}")
                     self._terminate_autocad()
@@ -323,26 +256,23 @@ class AutoCADProcessor:
                 self.com_doc = self.com_app.Documents.Open(os.path.abspath(input_path))
                 if self.wait_for_object_ready(self.com_doc, timeout=20.0, check_type="doc"):
                     self._log(f"Открыт: {os.path.basename(input_path)}")
-                    # Устанавливаем Visible = False после открытия документа
                     try:
                         self.com_app.Visible = False
                     except Exception as e:
                         self._log(f"Не удалось установить Visible = False: {e}")
-                    # Отключаем диалоговые окна и автосохранение
                     try:
                         self.com_doc.SendCommand("(setvar \"FILEDIA\" 0)\n")
                         self.com_doc.SendCommand("(setvar \"CMDDIA\" 0)\n")
                         self.com_doc.SendCommand("(setvar \"AUTOSAVE\" 0)\n")
                     except Exception as e:
                         self._log(f"Не удалось отключить диалоговые окна или автосохранение: {e}")
-                    # Выполняем RECOVER для исправления файла
                     try:
                         self.com_doc.SendCommand("RECOVER\n")
                         self._log(f"Выполнена команда RECOVER для {input_path}")
-                        time.sleep(2)  # Увеличенная задержка
+                        time.sleep(2)
                     except Exception as e:
                         self._log(f"Ошибка выполнения RECOVER для {input_path}: {e}")
-                    if self._process_all_entities():  # Проверяем успешность обработки
+                    if self._process_all_entities():
                         self.com_doc.SaveAs(os.path.abspath(output_path))
                         self._log(f"Сохранено: {output_path}")
                         success = True
@@ -357,7 +287,7 @@ class AutoCADProcessor:
                     time.sleep(3)
                     try:
                         if self.com_doc is not None:
-                            self.com_doc.Close(False)  # Отклонить изменения
+                            self.com_doc.Close(False)
                             self.com_doc = None
                         if self.com_app is not None:
                             self.com_app.Quit()
@@ -373,7 +303,7 @@ class AutoCADProcessor:
             finally:
                 try:
                     if self.com_doc is not None:
-                        self.com_doc.Close(False)  # Отклонить изменения
+                        self.com_doc.Close(False)
                         self.com_doc = None
                 except Exception as e:
                     self._log(f"Ошибка закрытия документа: {e}")
@@ -390,17 +320,7 @@ class AutoCADProcessor:
 
             filename = os.path.basename(input_path)
             name, ext = os.path.splitext(filename)
-            if name[0].isdigit():
-                new_name = f"{self.replacement_digit}{name[1:]}"
-            elif name.startswith("ED.D."):
-                new_name = re.sub(
-                    r'(ED\.D\.[A-Z]\d{3}\.)(\d)',
-                    lambda m: f"{m.group(1)}{self.replacement_digit}",
-                    name
-                )
-            else:
-                new_name = f"processed_{name}"
-            output_path = os.path.join(output_dir, new_name + ext)
+            output_path = os.path.join(output_dir, name + ext)  # Will be overwritten
             try:
                 results[input_path] = self.process_file(input_path, output_path)
             except Exception as e:
@@ -408,7 +328,7 @@ class AutoCADProcessor:
                 results[input_path] = False
                 try:
                     if self.com_doc is not None:
-                        self.com_doc.Close(False)  # Отклонить изменения
+                        self.com_doc.Close(False)
                         self.com_doc = None
                     if self.com_app is not None:
                         self.com_app.Quit()
@@ -423,7 +343,7 @@ class AutoCADProcessor:
     def __del__(self):
         try:
             if self.com_doc is not None:
-                self.com_doc.Close(False)  # Отклонить изменения
+                self.com_doc.Close(False)
                 self.com_doc = None
             if self.com_app is not None:
                 self.com_app.Quit()

@@ -1,3 +1,4 @@
+# excel_parser.py
 import os
 import re
 from shutil import rmtree
@@ -5,6 +6,7 @@ from tempfile import mkdtemp
 from zipfile import ZipFile
 from lxml import etree as ET
 import logging
+import json  # Оставляем, если нужно, но не используется для загрузки
 
 try:
     import win32com.client as win32
@@ -14,33 +16,32 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('ExcelProcessor')
 
-
 class ExcelProcessor:
-    def __init__(self, replacement_digit, log_callback=None, debug=False):
+    def __init__(self, replacement_digit, project, rules, log_callback=None, debug=False):
         self.replacement_digit = str(replacement_digit)
-        self.debug = debug  # Флаг отладки
-        self.log = log_callback or (lambda msg: None)  # Если колбэк не передан — молчит
-        self._log(f"Инициализация ExcelProcessor с цифрой: {self.replacement_digit}")
-        self.patterns = [
-            # ED.D.* — меняем только последнюю цифру
-            (re.compile(r'\b(ED\.D\.[A-Z]\d\d\d\.)\d'),
-             lambda m: f"{m.group(1)}{self.replacement_digit}"),
-            # 10UKD — меняем только первую цифру, буквы сохраняем
-            (re.compile(r'\b([0-9])(0[A-Z]{3})', flags=re.IGNORECASE),
-             lambda m: f"{self.replacement_digit}{m.group(2)}"),
-            # C02 -> C01 (если оставляем как раньше)
-            (re.compile(r'&R&11C0[2-9]\b'),
-             '&R&11C01'),
-            # C02 -> C01 (если оставляем как раньше)
-            (re.compile(r'&RC0[2-9]\b'),
-             '&RC01'),
-            # Для нижнего колонтитула - шифра
-            (re.compile(r'((?:&[LCR](?:&\d{2})?)?ED\.D\.[A-Z]\d\d\d\.)\d'),
-             lambda m: f"{m.group(1)}{self.replacement_digit}"),
-        ]
+        self.debug = debug
+        self.log = log_callback or (lambda msg: None)
+        self._log(f"Инициализация ExcelProcessor с цифрой: {self.replacement_digit} и проектом: {project}")
+        self.patterns = self._load_patterns(rules)
 
+    def _load_patterns(self, rules):
+        patterns = []
+        try:
+            for rule_name, rule in rules.items():
+                try:
+                    pattern = eval(rule["pattern"], {"re": re})
+                    replacement = eval(rule["replacement"], {"self": self})
+                    patterns.append((pattern, replacement))
+                    self._log(f"Загружено правило '{rule_name}'")
+                except Exception as e:
+                    self._log(f"Ошибка загрузки правила '{rule_name}': {e}")
+        except Exception as e:
+            self._log(f"Ошибка обработки rules: {e}")
+        if not patterns:
+            self._log("Предупреждение: Нет patterns для этого парсера")
+        return patterns
+    
     def _log(self, message):
-        # Логи, которые всегда записываются
         always_log = (
                 message.startswith("Успешно: ") or
                 message.startswith("Ошибка обработки: ") or
@@ -49,7 +50,6 @@ class ExcelProcessor:
                 message.startswith("Пропуск ") or
                 message.startswith("Файл успешно обработан: ")
         )
-        # Если отладка включена или это обязательный лог, вызываем callback
         if self.debug or always_log:
             self.log(message)
 
@@ -66,7 +66,6 @@ class ExcelProcessor:
     def _process_xml_tree(self, tree):
         modified = False
         nsmap = {'a': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
-        # --- Проход по всем узлам ---
         for elem in tree.iter():
             if elem.text:
                 new_text = self._apply_replacements(elem.text)
@@ -88,12 +87,10 @@ class ExcelProcessor:
         temp_input = None
 
         try:
-            # Проверка и конвертация .xls в .xlsm
             if input_path.lower().endswith('.xls'):
                 self._log(f"Обнаружен .xls файл. Конвертируем в .xlsm...")
                 temp_input = os.path.join(tmp_dir, 'converted.xlsm')
 
-                # Вариант 1: Через pywin32 и Excel (Windows)
                 if win32:
                     excel = win32.Dispatch('Excel.Application')
                     excel.Visible = False
@@ -106,12 +103,9 @@ class ExcelProcessor:
                     raise ImportError(
                         "pywin32 не установлен. Установите 'pip install pywin32' для конвертации на Windows.")
 
-
-
-                input_path = temp_input  # Теперь обрабатываем конвертированный файл
+                input_path = temp_input
                 converted = True
 
-            # Основная обработка (как раньше)
             with ZipFile(input_path) as zip_in:
                 filenames = zip_in.namelist()
                 zip_in.extractall(tmp_dir)

@@ -1,3 +1,4 @@
+# word_parser.py
 import os
 import re
 from shutil import rmtree
@@ -5,44 +6,38 @@ from tempfile import mkdtemp
 from zipfile import ZipFile
 from lxml import etree as ET
 import logging
+import json  # Оставляем, если нужно
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('WordProcessor')
 
 class WordProcessor:
-    def __init__(self, replacement_digit, log_callback=None, debug=False):
+    def __init__(self, replacement_digit, project, rules, log_callback=None, debug=False):
         self.replacement_digit = str(replacement_digit)
-        self.debug = debug  # Флаг отладки
-        self.log = log_callback or (lambda msg: None)  # Если колбэк не передан — молчит
-        self._log(f"Инициализация WordProcessor с цифрой: {self.replacement_digit}")
+        self.debug = debug
+        self.log = log_callback or (lambda msg: None)
+        self._log(f"Инициализация WordProcessor с цифрой: {self.replacement_digit} и проектом: {project}")
 
-        self.patterns = [
-            # ED.D.*  — меняем только последнюю цифру
-            (re.compile(r'\b(ED\.D\.[A-Z]\d\d\d\.)\d\b'),
-             lambda m: f"{m.group(1)}{self.replacement_digit}"),
+        self.patterns = self._load_patterns(rules)
 
-            # 10UKD  — меняем только первую цифру, буквы сохраняем
-            (re.compile(r'\b([0-9])0([A-Z]{3})\b', flags=re.IGNORECASE),
-             lambda m: f"{self.replacement_digit}0{m.group(2)}"),
-
-            # C02 -> C01 (если оставляем как раньше)
-            (re.compile(r'C0[2-9]\b'),
-             'C01'),
-            # Замена Блока / Unit
-            (re.compile(r'(Unit\s*)\d\b', flags=re.IGNORECASE),
-             lambda m: f"{m.group(1)}{self.replacement_digit}"),
-            (re.compile(r'(блока №\s*)\d\b', flags=re.IGNORECASE),
-             lambda m: f"{m.group(1)}{self.replacement_digit}"),
-        ]
-
-        if self.replacement_digit in ("3", "4"):
-            self.patterns.append(
-                (re.compile(r'\bED\.B\.P000\.S\b'),
-                 "ED.B.P000.W")
-            )
+    def _load_patterns(self, rules):
+        patterns = []
+        try:
+            for rule_name, rule in rules.items():
+                try:
+                    pattern = eval(rule["pattern"], {"re": re})
+                    replacement = eval(rule["replacement"], {"self": self})
+                    patterns.append((pattern, replacement))
+                    self._log(f"Загружено правило '{rule_name}'")
+                except Exception as e:
+                    self._log(f"Ошибка загрузки правила '{rule_name}': {e}")
+        except Exception as e:
+            self._log(f"Ошибка обработки rules: {e}")
+        if not patterns:
+            self._log("Предупреждение: Нет patterns для этого парсера")
+        return patterns
 
     def _log(self, message):
-        # Логи, которые всегда записываются
         always_log = (
             message.startswith("Успешно: ") or
             message.startswith("Ошибка обработки: ") or
@@ -51,7 +46,6 @@ class WordProcessor:
             message.startswith("Пропуск ") or
             message.startswith("Файл успешно обработан: ")
         )
-        # Если отладка включена или это обязательный лог, вызываем callback
         if self.debug or always_log:
             self.log(message)
 
@@ -69,7 +63,6 @@ class WordProcessor:
         modified = False
         nsmap = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
 
-        # --- 1. Проход по всем узлам ---
         for elem in tree.iter():
             if elem.text:
                 new_text = self._apply_replacements(elem.text)
@@ -82,38 +75,35 @@ class WordProcessor:
                     elem.tail = new_tail
                     modified = True
 
-        # --- 2. Дополнительный проход — для случаев, когда "C0" и цифра разделены ---
         for parent in tree.findall('.//w:p', namespaces=nsmap) + tree.findall('.//w:sdtContent', namespaces=nsmap):
             texts = parent.findall('.//w:t', namespaces=nsmap)
             if len(texts) < 2:
                 continue
 
-            # Склеиваем текст всех <w:t> в этом контейнере
             full_text = ''.join(t.text or '' for t in texts)
             new_full_text = self._apply_replacements(full_text)
 
             if new_full_text != full_text:
                 modified = True
-                # Распределяем обратно по тем же <w:t>
                 idx = 0
                 for t in texts:
-                    part_len = len(t.text or '')
-                    t.text = new_full_text[idx:idx + part_len]
-                    idx += part_len
+                    if t.text is not None:
+                        part_len = len(t.text)
+                        t.text = new_full_text[idx:idx + part_len]
+                        idx += part_len
 
-        # --- 3. Новый блок: Очистка текста в столбцах таблицы "Лист регистрации изменений" или "Record of revisions" ---
         for p in tree.findall('.//w:p', namespaces=nsmap):
             para_texts = ''.join(t.text or '' for t in p.findall('.//w:t', namespaces=nsmap)).strip()
             if re.search(r'Лист\s+регистрации\s+изменений|Record\s+of\s+revisions', para_texts, re.IGNORECASE):
-                # Находим следующую таблицу после параграфа
                 tbl = p.getnext()
                 while tbl is not None and tbl.tag != '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tbl':
                     tbl = tbl.getnext()
                 if tbl is not None:
-                    self._log("Найдена таблица 'Лист регистрации изменений' или 'Record of revisions'. Очистка данных в столбцах.")
+                    self._log(
+                        "Найдена таблица 'Лист регистрации изменений' или 'Record of revisions'. Очистка данных в столбцах.")
                     rows = tbl.findall('w:tr', namespaces=nsmap)
                     if len(rows) > 1:
-                        for row in rows[2:]:  # Обрабатываем только строки данных, пропуская заголовок (первая строка)
+                        for row in rows[2:]:
                             cells = row.findall('w:tc', namespaces=nsmap)
                             for cell in cells:
                                 for t in cell.findall('.//w:t', namespaces=nsmap):

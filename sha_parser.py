@@ -1,3 +1,12 @@
+# sha_parser.py
+"""Модуль sha_parser.py: Обработка файлов SHA через WinAPI и COM-интерфейс SmartSketch.
+
+Этот модуль предоставляет инструменты для автоматизации замены текста в файлах SHA
+с использованием регулярных выражений и COM-объектов. Он ориентирован на Windows
+и требует установки pywin32. Основной класс: ShaProcessorWinAPI.
+
+Зависимости: os, re, sys, winreg, win32com.client, pythoncom, pywintypes, time, json.
+"""
 import os
 import re
 import winreg
@@ -6,8 +15,17 @@ import pythoncom
 import pywintypes
 import time
 
+
 def get_license_servers_from_registry():
-    """Читаем серверы лицензий из реестра и формируем строку INGR_LICENSE_PATH"""
+    """
+    Читает серверы лицензий из реестра Windows и формирует строку для INGR_LICENSE_PATH.
+
+    Открывает ключ реестра, извлекает значение 'server_names', добавляет порт 27000
+    и объединяет в строку с разделителем ';'. Если ключ не найден или ошибка - возвращает
+    пустую строку.
+    :return: Строка с серверами лицензий в формате '27000@server1;27000@server2' или ''.
+    :raise: OSError: Если доступ к реестру запрещён или ключ не существует.
+    """
     try:
         path = r"SOFTWARE\WOW6432Node\Intergraph\Pdlice_etc\server_names"
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path) as key:
@@ -19,7 +37,16 @@ def get_license_servers_from_registry():
         return ""
 
 def wait_for_object_ready(obj, timeout=3.0):
-    """Ожидание готовности COM-объекта (без лишних логов)."""
+    """
+    Ожидает готовности COM-объекта в цикле с обработкой сообщений.
+
+    Использует pythoncom.PumpWaitingMessages() для обработки очереди сообщений COM.
+    Проверяет, что объект не None. Если таймаут истёк - возвращает False.
+    Необходима для исключения RPC ошибки
+    :param obj: COM-объект для проверки (например, документ или приложение).
+    :param timeout: Максимальное время ожидания в секундах. По дефолту 3.0 сек.
+    :return: True, если объект готов; False, если таймаут истёк.
+    """
     start_time = time.time()
     while time.time() - start_time < timeout:
         try:
@@ -32,37 +59,112 @@ def wait_for_object_ready(obj, timeout=3.0):
     return False
 
 class ShaProcessorWinAPI:
-    def __init__(self, replacement_digit, log_callback=None, debug=False):
-        self.replacement_digit = str(replacement_digit)
-        self.debug = debug  # Флаг отладки
-        self.log = log_callback or (lambda msg: None)  # Если колбэк не передан — молчит
-        self.app = None
-        self._log(f"Инициализация ShaProcessorWinAPI с цифрой: {self.replacement_digit}")
+    """
+    Класс для автоматической обработки файлов SmartSketch (Shape2DServer) через WinAPI/COM.
 
-        self.patterns = [
-            # ED.D.P000.N → замена N
-            (re.compile(r'(ED\.D\.[A-Z]\d{3}\.)(\d)'),
-             lambda m: f"{m.group(1)}{self.replacement_digit}"),
+    Основные возможности:
+    - Запуск и завершение SmartSketch через COM-интерфейс.
+    - Чтение правил замены текста (regex) и применение их ко всем текстовым объектам документа.
+    - Поиск и изменение текста в различных элементах: TextBox, надписи, свойства объектов, группы и вложенные группы.
+    - Сохранение измененного документа в новый файл, если были найдены и применены изменения.
 
-            # N0&&&&&BQ2200 → замена N
-            (re.compile(r'([1-9])(0&&&&&[A-Z]{2}\d{4})'),
-             lambda m: f"{self.replacement_digit}{m.group(2)}"),
+    Параметры:
+        replacement_digit (str|int):
+            Цифра или символ, используемый в функциях замены.
 
-            # N0KTC → замена N
-            (re.compile(r'([1-9])(0[A-Z]{3})'),
-             lambda m: f"{self.replacement_digit}{m.group(2)}"),
+        project (str):
+            Название или код проекта (не используется напрямую внутри класса, но полезен для логов или внешней логики).
 
-            # alt="C0N" → alt="C01"
-            (re.compile(re.escape('<?xml version="1.0"?><body><intstgxml stream="Revision" select="/Revision/RevisionRecord[last()-0]/MajorRev_ForRevise" alt="C01"/><intstgxml stream="Revision" select="/Revision/RevisionRecord[last()-0]/MinorRev_ForRevise" alt=""/></body>')),
-                        '<?xml version="1.0"?><body><intstgxml stream="Revision" select="/Revision/RevisionRecord[last()-10]/MajorRev_ForRevise" alt="C01"/><intstgxml stream="Revision" select="/Revision/RevisionRecord[last()-10]/MinorRev_ForRevise" alt=""/></body>'),
+        rules (dict):
+            Набор правил замены. Каждый ключ — имя правила, значение — словарь с полями:
+                "pattern"      - выражение регулярного поиска (как строка, интерпретируемая через eval),
+                "replacement"  - выражение замены (также исполняется через eval).
 
-            # C0N → C01
-            (re.compile(r'\bC0[2-9]\b'),
-             'C01')
-        ]
+            Пример:
+            {
+                "rule1": {
+                    "pattern": "re.compile(r\"ABC\")",
+                    "replacement": "lambda m: \"XYZ\""
+                }
+            }
+
+        log_callback (callable, необязательно):
+            Функция для вывода логов. Если не задана, логирование отключено.
+            Передаваемая функция должна принимать один аргумент: строку сообщения.
+
+        debug (bool):
+            Если True - логируются все сообщения. Иначе — только важные.
+
+    Основные методы:
+        start_app():
+            Запускает приложение SmartSketch и готовит COM-среду.
+
+        stop_app():
+            Корректно завершает приложение SmartSketch и освобождает COM-ресурсы.
+
+        process_file(input_path, output_path):
+            Открывает файл SmartSketch, выполняет поиск и замену текста по правилам,
+            сохраняет результат в указанный путь (если были изменения),
+            а затем закрывает документ.
+
+    Примечания:
+        - Класс рассчитан на работу только в Windows и требует установленного SmartSketch.
+        - Для корректной работы должны быть доступны серверы лицензирования SmartSketch.
+        - Правила замены должны быть корректно сформированы, поскольку используются через eval().
+    """
+    def __init__(self, replacement_digit, project, rules, log_callback=None, debug=False):
+        """
+        Инициализирует экземпляр ShaProcessorWinAPI.
+
+        Конвертирует replacement_digit в строку, устанавливает флаги и логирование,
+        загружает паттерны из rules.
+
+        :param replacement_digit: Цифра для замены (будет конвертирована в str).
+        :param project: Название проекта для логирования.
+        :param rules: Словарь правил с 'pattern' и 'replacement'.
+        :param log_callback: Параметр для логирования. По дефолту None.
+        :param debug: Включает отладочное логирование.
+        """
+        self.replacement_digit = str(replacement_digit)    # цифра, которая участвует в заменах.
+        self.debug = debug                                 # словарь с регулярками для поиска/замены текста.
+        self.log = log_callback or (lambda msg: None)      # функция для логирования
+        self._log(f"Инициализация ShaProcessorWinAPI с цифрой: {self.replacement_digit} и проектом: {project}")
+
+        self.patterns = self._load_patterns(rules)         # загружаем и компилируем правила замен
+
+    def _load_patterns(self, rules):
+        """
+        Загружает паттерны замен из словаря правил.
+
+        Для каждого правила eval'ит pattern (re.compile) и replacement.
+        Логирует загрузку или ошибки. Если правил нет - выдаёт предупреждение.
+
+        :param rules: Словарь {rule_name: {'pattern': str, 'replacement': str}}.
+        :return: Список кортежей (compiled_pattern, replacement_func_or_str).
+        """
+        patterns = []
+        try:
+            for rule_name, rule in rules.items():
+                try:
+                    pattern = eval(rule["pattern"], {"re": re})
+                    replacement = eval(rule["replacement"], {"self": self})
+                    patterns.append((pattern, replacement))
+                    self._log(f"Загружено правило '{rule_name}'")
+                except Exception as e:
+                    self._log(f"Ошибка загрузки правила '{rule_name}': {e}")
+        except Exception as e:
+            self._log(f"Ошибка обработки rules: {e}")
+        if not patterns:
+            self._log("Предупреждение: Нет patterns для этого парсера")
+        return patterns
 
     def _log(self, message):
-        # Логи, которые всегда записываются
+        '''
+        Внутренний метод логирования.
+        Проверяет, нужно ли логгировать (debug или always_log по префиксам), и вызывает self.log.
+        :param message: Сообщение для логирования.
+        :return: None
+        '''
         always_log = (
             message.startswith("Успешно: ") or
             message.startswith("Ошибка обработки: ") or
@@ -75,12 +177,16 @@ class ShaProcessorWinAPI:
             message.startswith("COM ошибка при обработке ") or
             message.startswith("Ошибка обработки ")
         )
-        # Если отладка включена или это обязательный лог, вызываем callback
         if self.debug or always_log:
             self.log(message)
 
     def start_app(self):
-        """Запуск SmartSketch один раз с установкой лицензии."""
+        """
+        Запускает приложение.
+        Инициализирует COM, получает лицензии, устанавливает env-var, диспатчит COM-объект SmartSketch, логирует.
+        :return: None
+        :raise: RuntimeError: Если приложение не запустилось.
+        """
         pythoncom.CoInitialize()
 
         servers = get_license_servers_from_registry()
@@ -99,7 +205,12 @@ class ShaProcessorWinAPI:
             raise
 
     def stop_app(self):
-        """Закрытие SmartSketch."""
+        """
+        Останавливает приложение SmartSketch и деинициализирует COM.
+        Вызывает Quit на app, если оно существует, и очищает ресурсы.
+
+        :return: None
+        """
         try:
             if self.app:
                 self.app.Quit()
@@ -111,7 +222,14 @@ class ShaProcessorWinAPI:
             pythoncom.CoUninitialize()
 
     def _replace_text_in_object(self, text_obj, obj_name):
-        """Замена текста в объекте."""
+        """
+        Заменяет текст в объекте, если присутствует атрибут 'Text'.
+        Применяет все паттерны из self.patterns. Логирует изменения или ошибки.
+
+        :param text_obj: COM-объект с возможным атрибутом 'Text'.
+        :param obj_name: Имя объекта для логирования.
+        :return: True, если текст был изменён; False иначе
+        """
         try:
             if hasattr(text_obj, "Text"):
                 text = text_obj.Text
@@ -119,7 +237,6 @@ class ShaProcessorWinAPI:
                     original_text = text
                     for pattern, replacement in self.patterns:
                         text = pattern.sub(replacement, text)
-
                     if text != original_text:
                         text_obj.Text = text
                         self._log(f"[ИЗМЕНЕНО] {obj_name}: '{original_text}' → '{text}'")
@@ -129,13 +246,21 @@ class ShaProcessorWinAPI:
         return False
 
     def _process_group(self, group, group_name, depth=0):
+        """
+        Рекурсивно обрабатывает группу объектов.
+        Ограничивает глубину 3, чтобы избежать бесконечной рекурсии.
+        Для каждого item: заменяет текст generic'ом, рекурсивно обрабатывает подгруппы.
+        :param group: COM-группа объектов.
+        :param group_name: Имя группы для логирования.
+        :param depth: Текущая глубина рекурсии.
+        :return: True, если были изменения; False иначе.
+        """
         if depth > 3:
             return False
         changes = False
 
         try:
             if hasattr(group, "Item") and hasattr(group, "Count"):
-
                 for i in range(1, group.Count + 1):
                     try:
                         item = group.Item(i)
@@ -151,7 +276,14 @@ class ShaProcessorWinAPI:
         return changes
 
     def _replace_text_generic(self, obj, obj_name):
-        """Универсальная замена текста по набору свойств (для объектов в Group.Item)."""
+        """
+        Универсально заменяет текст в объекте по списку свойств.
+        Проверяет свойства вроде 'Text', 'Caption' и т.д., применяет паттерны, устанавливает новое, логирует.
+
+        :param obj: COM-объект для обработки.
+        :param obj_name: Имя объекта для логирования.
+        :return: True, если были изменения; False иначе.
+        """
         text_properties = ["Text", "TextString", "Caption", "Value", "String",
                            "Content", "Name", "Label", "Description"]
         changed = False
@@ -175,7 +307,15 @@ class ShaProcessorWinAPI:
         return changed
 
     def process_file(self, input_path, output_path):
-        """Открыть файл, заменить текст и сохранить новый."""
+        """
+        Обрабатывает файл SHA: открывает, заменяет текст, сохраняет если изменения.
+        Обрабатывает TextBoxes и Groups на каждом листе. Закрывает документ в finally.
+
+        :param input_path: Путь к входному файлу.
+        :param output_path: Путь для сохранения выходного файла.
+        :return: True, если обработка успешна; False при ошибках.
+        :raise: RuntimeError: Если приложение не запущено.
+        """
         if not self.app:
             raise RuntimeError("SmartSketch не запущен")
 
@@ -188,19 +328,16 @@ class ShaProcessorWinAPI:
             for sheet_idx, sheet in enumerate(doc.Sheets, start=1):
                 self._log(f"--- Лист {sheet_idx}/{doc.Sheets.Count} ---")
 
-                # Текстовые блоки на листе
                 if hasattr(sheet, "TextBoxes") and sheet.TextBoxes is not None:
                     for tb_idx, tb in enumerate(sheet.TextBoxes, start=1):
                         if self._replace_text_in_object(tb, f"TextBox {tb_idx} на Листе {sheet_idx}"):
                             changes_made = True
 
-                # Группы на листе
                 if hasattr(sheet, "Groups") and sheet.Groups is not None:
                     for group_idx, group in enumerate(sheet.Groups, start=1):
                         if self._process_group(group, f"Group {group_idx} на Листе {sheet_idx}"):
                             changes_made = True
 
-            # Сохраняем, если есть изменения
             if changes_made:
                 doc.SaveAs(output_path)
                 self._log(f"Документ сохранён: {output_path}")
