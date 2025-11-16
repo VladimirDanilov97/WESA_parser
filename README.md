@@ -19,7 +19,7 @@ The application only works on Windows, as it uses COM interfaces (win32com) to i
 
 Author: Artem Bayushkin 
 
-Version: 0.95 beta
+Version: 1.02
 
 ## **Functions**
 
@@ -71,7 +71,7 @@ Make sure that AutoCAD, Office, and SmartSketch are installed and licensed.
 
 (Optional) Compile to EXE using PyInstaller:
 
-`pyinstaller --onefile --icon=icon.ico main.py`
+`pyinstaller --noconsole --add-data "config.json;." --icon=icon.ico --add-data "icon.png;." wesa.py`
 
 ## **Using**
 
@@ -140,7 +140,7 @@ WESA_Parser — это графическое приложение на Python �
 
 Автор: Артем Баюшкин 
 
-Версия: 0.95 beta
+Версия: 1.02
 
 ## **Функции**
 
@@ -192,7 +192,7 @@ WESA_Parser — это графическое приложение на Python �
 
 (Опционально) Скомпилируйте в EXE с помощью PyInstaller:
 
-`pyinstaller --onefile --icon=icon.ico main.py`
+`pyinstaller --noconsole --add-data "config.json;." --icon=icon.ico --add-data "icon.png;." wesa.py`
 
 ## **Использование**
 
